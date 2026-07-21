@@ -1,45 +1,82 @@
 using ImageMagick;
-using System.ComponentModel;
 using System.Diagnostics;
-using System.Reflection;
 
 namespace HEICtoJPGConverter
 {
     public partial class Form1 : Form
     {
-        enum ConvertType
+        enum FileFormat
         {
-            [Description("HEIC -> JPG")]
-            HEICtoJPG,
-            [Description("MP4 -> MP3")]
-            Mp4toMp3,
+            HEIC,
+            JPG,
+            PNG,
+            WEBP,
+            MP4,
+            MP3,
+            MOV,
         }
+
+        enum ConversionEngine
+        {
+            Image,
+            Ffmpeg,
+        }
+
+        record ConversionRule(FileFormat Source, FileFormat Target, ConversionEngine Engine, string? FfmpegArgs = null)
+        {
+            public string SourceExtension => Source.ToString().ToLower();
+            public string TargetExtension => Target.ToString().ToLower();
+        }
+
+        private static readonly FileFormat[] LossyImageFormats = { FileFormat.JPG, FileFormat.WEBP, FileFormat.HEIC };
+
+        private static readonly List<ConversionRule> ConversionRules = new()
+        {
+            // ì´ë¯¸ì§€ ìƒí˜¸ë³€í™˜ (HEIC / JPG / PNG / WEBP)
+            new(FileFormat.HEIC, FileFormat.JPG, ConversionEngine.Image),
+            new(FileFormat.HEIC, FileFormat.PNG, ConversionEngine.Image),
+            new(FileFormat.HEIC, FileFormat.WEBP, ConversionEngine.Image),
+            new(FileFormat.JPG, FileFormat.HEIC, ConversionEngine.Image),
+            new(FileFormat.JPG, FileFormat.PNG, ConversionEngine.Image),
+            new(FileFormat.JPG, FileFormat.WEBP, ConversionEngine.Image),
+            new(FileFormat.PNG, FileFormat.HEIC, ConversionEngine.Image),
+            new(FileFormat.PNG, FileFormat.JPG, ConversionEngine.Image),
+            new(FileFormat.PNG, FileFormat.WEBP, ConversionEngine.Image),
+            new(FileFormat.WEBP, FileFormat.HEIC, ConversionEngine.Image),
+            new(FileFormat.WEBP, FileFormat.JPG, ConversionEngine.Image),
+            new(FileFormat.WEBP, FileFormat.PNG, ConversionEngine.Image),
+
+            // ë¹„ë””ì˜¤ / ì˜¤ë””ì˜¤
+            new(FileFormat.MP4, FileFormat.MP3, ConversionEngine.Ffmpeg, "-vn -c:a libmp3lame -q:a 0"),
+            new(FileFormat.MOV, FileFormat.MP4, ConversionEngine.Ffmpeg, "-c:v copy -c:a copy -movflags +faststart"),
+        };
 
         public Form1()
         {
             InitializeComponent();
 
-            foreach (ConvertType type in Enum.GetValues(typeof(ConvertType)))
+            foreach (FileFormat source in ConversionRules.Select(r => r.Source).Distinct())
             {
-                string description = GetEnumDescription(type);
-                if (description != "") CbConvertType.Items.Add(new KeyValuePair<ConvertType, string>(type, description));
+                CbSourceFormat.Items.Add(source);
             }
 
-            CbConvertType.DisplayMember = "Value";
-            CbConvertType.ValueMember = "Key";
-
-            if (CbConvertType.Items.Count > 0)
-                CbConvertType.SelectedIndex = 0;
+            if (CbSourceFormat.Items.Count > 0)
+                CbSourceFormat.SelectedIndex = 0;
         }
 
-        private static string GetEnumDescription(Enum value)
+        private void CbSourceFormat_SelectedIndexChanged(object sender, EventArgs e)
         {
-            FieldInfo? fi = value.GetType().GetField(value.ToString());
-            if (fi == null) return "";
+            CbTargetFormat.Items.Clear();
 
-            var attributes = (DescriptionAttribute[])fi.GetCustomAttributes(typeof(DescriptionAttribute), false);
+            if (CbSourceFormat.SelectedItem is not FileFormat source) return;
 
-            return attributes.Length > 0 ? attributes[0].Description : value.ToString();
+            foreach (ConversionRule rule in ConversionRules.Where(r => r.Source == source))
+            {
+                CbTargetFormat.Items.Add(rule.Target);
+            }
+
+            if (CbTargetFormat.Items.Count > 0)
+                CbTargetFormat.SelectedIndex = 0;
         }
 
         private void BtnDirectorySelect_Click(object sender, EventArgs e)
@@ -54,117 +91,145 @@ namespace HEICtoJPGConverter
             TbxDirectoryPath.Text = directory.SelectedPath;
         }
 
-        private void BtnConvert_Click(object sender, EventArgs e)
+        private async void BtnConvert_Click(object sender, EventArgs e)
         {
             if (TbxDirectoryPath.Text.Trim().Length == 0)
             {
-                MessageBox.Show("µğ·ºÅä¸®°¡ ¼±ÅÃµÇÁö ¾Ê¾Ò¾î¿ä.", "", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("ë””ë ‰í† ë¦¬ê°€ ì„ íƒë˜ì§€ ì•Šì•˜ìŠµë‹ˆë‹¤.", "", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (CbSourceFormat.SelectedItem is not FileFormat source || CbTargetFormat.SelectedItem is not FileFormat target)
+            {
+                MessageBox.Show("ë³€í™˜ íƒ€ì…ì´ ì„ íƒë˜ì§€ ì•Šì•˜ìŠµë‹ˆë‹¤.", "", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            ConversionRule? rule = ConversionRules.FirstOrDefault(r => r.Source == source && r.Target == target);
+            if (rule == null)
+            {
+                MessageBox.Show("ì§€ì›í•˜ì§€ ì•ŠëŠ” ë³€í™˜ ì¡°í•©ì…ë‹ˆë‹¤.", "", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
             try
             {
                 BtnConvert.Enabled = false;
-                BtnConvert.Text = "º¯È¯ Áß";
+                BtnConvert.Text = "ë³€í™˜ ì¤‘";
 
-                if (CbConvertType.SelectedItem == null)
+                string[] files = Directory.GetFiles(TbxDirectoryPath.Text, $"*.{rule.SourceExtension}");
+                InitProgress(files.Length);
+
+                for (int i = 0; i < files.Length; i++)
                 {
-                    MessageBox.Show("º¯È¯ Å¸ÀÔÀÌ ¼±ÅÃµÇÁö ¾Ê¾Ò¾î¿ä.", "", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return;
+                    FileInfo info = new(files[i]);
+                    string outputPath = Path.Combine(TbxDirectoryPath.Text, Path.GetFileNameWithoutExtension(info.Name) + "." + rule.TargetExtension);
+
+                    await Task.Run(() =>
+                    {
+                        if (rule.Engine == ConversionEngine.Image)
+                            ConvertImage(info.FullName, outputPath, rule.Target);
+                        else
+                            ConvertWithFfmpeg(info.FullName, outputPath, rule.FfmpegArgs!);
+                    });
+
+                    UpdateProgress(i + 1, files.Length, info.Name);
                 }
 
-                switch (((KeyValuePair<ConvertType, string>)CbConvertType.SelectedItem).Key)
-                {
-                    case ConvertType.HEICtoJPG:
-                        string[] allfiles = Directory.GetFiles(TbxDirectoryPath.Text, "*.heic");
-
-                        foreach (var file in allfiles)
-                        {
-                            FileInfo info = new(file);
-                            using (MagickImage image = new(info.FullName))
-                            {
-                                // Save frame as jpg
-                                image.Write($"{TbxDirectoryPath.Text}\\{info.Name.Replace(".heic", "")}.jpg");
-                            }
-                        }
-                        break;
-                    case ConvertType.Mp4toMp3:
-                        string[] allMp4Files = Directory.GetFiles(TbxDirectoryPath.Text, "*.mp4");
-                        foreach (var file in allMp4Files)
-                        {
-                            FileInfo info = new(file);
-                            string outputPath = Path.Combine(TbxDirectoryPath.Text, Path.GetFileNameWithoutExtension(info.Name) + ".mp3");
-
-                            using (Process process = new())
-                            {
-                                process.StartInfo = new ProcessStartInfo
-                                {
-                                    FileName = "ffmpeg",
-                                    Arguments = $"-i \"{info.FullName}\" -vn -ab 192k -ar 44100 -y \"{outputPath}\"",
-                                    CreateNoWindow = true,
-                                    UseShellExecute = false,
-                                    RedirectStandardOutput = true,
-                                    RedirectStandardError = true
-                                };
-
-                                process.Start();
-
-                                string errorOutput = process.StandardError.ReadToEnd();
-                                string output = process.StandardOutput.ReadToEnd();
-
-                                process.WaitForExit();
-
-                                if (process.ExitCode != 0)
-                                    throw new Exception($"º¯È¯ ½ÇÆĞ: {errorOutput}");
-                            }
-                        }
-                        break;
-                }
-
-                MessageBox.Show("º¯È¯ ¿Ï·á!", "", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show("ë³€í™˜ ì™„ë£Œ!", "", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
-                MessageBox.Show(ex.Message, "", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                if (ex.Message.Contains("/202"))
+                {
+                    MessageBox.Show($"íŒŒì¼ì´ ì†ìƒë˜ì—ˆìŠµë‹ˆë‹¤.\r\n{ex.Message}", "", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                else if (ex.Message.Contains("/726"))
+                {
+                    MessageBox.Show($"íŒŒì¼ í™•ì¥ìê°€ ì¼ì¹˜í•˜ì§€ ì•ŠìŠµë‹ˆë‹¤.\r\n{ex.Message}", "", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                else
+                {
+                    MessageBox.Show(ex.Message, "", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
             }
             finally
             {
                 BtnConvert.Enabled = true;
-                BtnConvert.Text = "º¯È¯";
+                BtnConvert.Text = "ë³€í™˜";
+                ResetProgress();
             }
+        }
+
+        private static void ConvertImage(string inputPath, string outputPath, FileFormat target)
+        {
+            using MagickImage image = new(inputPath);
+            if (LossyImageFormats.Contains(target))
+                image.Quality = 95;
+            image.Write(outputPath);
+        }
+
+        private static void ConvertWithFfmpeg(string inputPath, string outputPath, string ffmpegArgs)
+        {
+            using Process process = new();
+            process.StartInfo = new ProcessStartInfo
+            {
+                FileName = "ffmpeg",
+                Arguments = $"-i \"{inputPath}\" {ffmpegArgs} -y \"{outputPath}\"",
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            process.Start();
+
+            string errorOutput = process.StandardError.ReadToEnd();
+            string output = process.StandardOutput.ReadToEnd();
+
+            process.WaitForExit();
+
+            if (process.ExitCode != 0)
+                throw new Exception($"ë³€í™˜ ì‹¤íŒ¨: {errorOutput}");
+        }
+
+        private void InitProgress(int total)
+        {
+            PbConvert.Minimum = 0;
+            PbConvert.Maximum = Math.Max(total, 1);
+            PbConvert.Value = 0;
+            LblProgress.Text = total == 0 ? "ë³€í™˜í•  íŒŒì¼ì´ ì—†ìŠµë‹ˆë‹¤." : $"0 / {total}";
+        }
+
+        private void UpdateProgress(int current, int total, string fileName)
+        {
+            PbConvert.Value = current;
+            LblProgress.Text = $"{current} / {total} ì™„ë£Œ ({fileName})";
+        }
+
+        private void ResetProgress()
+        {
+            PbConvert.Value = 0;
+            LblProgress.Text = "";
         }
 
         private void BtnSelectTypeDelete_Click(object sender, EventArgs e)
         {
-            if (MessageBox.Show("¼±ÅÃÇÑ Å¸ÀÔÀÇ ÆÄÀÏµéÀ» µğ·ºÅä¸®¿¡¼­ ÀüºÎ Á¦°ÅÇÒ°Ç°¡¿ä?", "", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
-
-            if (CbConvertType.SelectedItem == null)
+            if (CbSourceFormat.SelectedItem is not FileFormat source)
             {
-                MessageBox.Show("º¯È¯ Å¸ÀÔÀÌ ¼±ÅÃµÇÁö ¾Ê¾Ò¾î¿ä.", "", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("ë³€í™˜ íƒ€ì…ì´ ì„ íƒë˜ì§€ ì•Šì•˜ìŠµë‹ˆë‹¤.", "", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
-            string[] allFiles;
-            switch (((KeyValuePair<ConvertType, string>)(CbConvertType.SelectedItem)).Key)
-            {
-                case ConvertType.HEICtoJPG:
-                    allFiles = Directory.GetFiles(TbxDirectoryPath.Text, "*.heic");
+            if (MessageBox.Show($"ì„ íƒí•œ ì›ë³¸ í˜•ì‹({source}) íŒŒì¼ë“¤ì„ ë””ë ‰í† ë¦¬ì—ì„œ ëª¨ë‘ ì‚­ì œí•˜ì‹œê² ìŠµë‹ˆê¹Œ?", "", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
 
-                    foreach (var file in allFiles)
-                    {
-                        File.Delete(file);
-                    }
-                    break;
-                case ConvertType.Mp4toMp3:
-                    allFiles = Directory.GetFiles(TbxDirectoryPath.Text, "*.mp4");
-                    foreach (var file in allFiles)
-                    {
-                        File.Delete(file);
-                    }
-                    break;
+            string[] allFiles = Directory.GetFiles(TbxDirectoryPath.Text, $"*.{source.ToString().ToLower()}");
+            foreach (var file in allFiles)
+            {
+                File.Delete(file);
             }
 
-            MessageBox.Show("Á¦°Å ¿Ï·á!", "", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show("ì‚­ì œ ì™„ë£Œ!", "", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
     }
 }
